@@ -1,0 +1,10 @@
+{
+  "target_os": [
+    "ubuntu"
+  ],
+  "max_fix_attempts": 5,
+  "github_timeout": 300,
+  "auto_commit": true,
+  "verbose_logging": true,
+  "claude_model": "claude-3-5-sonnet-20241022"
+}
