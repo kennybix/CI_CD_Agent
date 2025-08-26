@@ -53,7 +53,7 @@ Respond in JSON format:
 
         try:
             response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-sonnet-4-20250514",
                 max_tokens=2000,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -94,7 +94,7 @@ Respond with JSON containing the content of each file:
 
         try:
             response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-sonnet-4-20250514",
                 max_tokens=4000,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -118,6 +118,19 @@ Respond with JSON containing the content of each file:
                 if error_file in source_files:
                     source_context += f"\n=== {error_file} (snippet) ===\n"
                     source_context += source_files[error_file][:1000] + "\n...\n"
+        
+        # If error log is too short or unhelpful, provide more context
+        if len(error_log) < 100 or "Could not retrieve" in error_log:
+            error_log = f"""Build failed but detailed logs are not available.
+Common issues to check:
+1. Missing dependencies in vcpkg.json
+2. Incorrect CMake configuration
+3. Missing source files in CMakeLists.txt
+4. C++ standard compatibility issues
+5. Library linking problems
+
+Current attempt: {attempt}
+Build files were generated but compilation failed."""
         
         prompt = f"""Build attempt {attempt} failed with these errors:
 
@@ -158,7 +171,7 @@ Respond with JSON:
 
         try:
             response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-sonnet-4-20250514",
                 max_tokens=4000,
                 messages=[
                     {"role": "user", "content": prompt}
@@ -166,10 +179,87 @@ Respond with JSON:
             )
             
             json_str = self._extract_json(response.content[0].text)
-            return json.loads(json_str)
+            result = json.loads(json_str)
+            
+            # If we didn't get a proper diagnosis, provide a default one
+            if not result.get('diagnosis') or result.get('diagnosis') == 'Failed to analyze':
+                result['diagnosis'] = "Unable to parse specific error. Attempting common fixes."
+                result['confidence'] = 0.5
+                
+                # Provide some default fixes based on attempt number
+                if attempt == 1:
+                    # Try adding more dependencies
+                    current_vcpkg = json.loads(current_files.get('vcpkg.json', '{}'))
+                    current_vcpkg['dependencies'] = list(set(
+                        current_vcpkg.get('dependencies', []) + 
+                        ['boost', 'openssl', 'pthread', 'filesystem']
+                    ))
+                    result['vcpkg_changes'] = json.dumps(current_vcpkg, indent=2)
+                elif attempt == 2:
+                    # Try fixing CMakeLists.txt
+                    result['cmake_changes'] = self._generate_improved_cmake(current_files, source_files)
+            
+            return result
+            
         except Exception as e:
             print(f"Claude error fix failed: {e}")
-            return {"diagnosis": "Failed to analyze", "confidence": 0.0}
+            # Return a more helpful fallback
+            return {
+                "diagnosis": f"Failed to analyze: {str(e)[:100]}",
+                "confidence": 0.2,
+                "vcpkg_changes": None,
+                "cmake_changes": None,
+                "workflow_changes": None,
+                "code_changes": {},
+                "requires_code_change": False
+            }
+    
+    def _generate_improved_cmake(self, current_files: Dict, source_files: Dict = None) -> str:
+        """Generate an improved CMakeLists.txt based on available files"""
+        if not source_files:
+            return None
+            
+        # Get all cpp files
+        cpp_files = [f for f in source_files.keys() if f.endswith('.cpp')]
+        
+        cmake = f"""cmake_minimum_required(VERSION 3.16)
+project(StatArbSystem)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find packages
+find_package(Threads REQUIRED)
+find_package(CURL REQUIRED)
+find_package(nlohmann_json REQUIRED)
+
+# Include directories
+include_directories(${{CMAKE_CURRENT_SOURCE_DIR}})
+
+# Add executable with all source files
+add_executable(StatArbSystem
+    {' '.join(cpp_files)}
+)
+
+# Link libraries
+target_link_libraries(StatArbSystem PRIVATE
+    Threads::Threads
+    CURL::libcurl
+    nlohmann_json::nlohmann_json
+)
+
+# Platform-specific settings
+if(UNIX AND NOT APPLE)
+    target_link_libraries(StatArbSystem PRIVATE pthread)
+endif()
+
+if(MSVC)
+    target_compile_options(StatArbSystem PRIVATE /W4)
+else()
+    target_compile_options(StatArbSystem PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+"""
+        return cmake
     
     def _extract_json(self, text: str) -> str:
         """Extract JSON from Claude's response"""
@@ -320,11 +410,55 @@ class GitHubAPI:
     
     def get_run_logs(self, run_id: int) -> str:
         """Get logs for a workflow run"""
+        # First try to get the logs URL
         url = f"{self.base_url}/actions/runs/{run_id}/logs"
         response = requests.get(url, headers=self.headers, allow_redirects=True)
+        
         if response.status_code == 200:
-            return response.text
-        return ""
+            # For GitHub Actions, logs come as a zip file
+            # We need to handle this properly
+            import zipfile
+            import io
+            
+            try:
+                # Create a file-like object from the response content
+                zip_file = zipfile.ZipFile(io.BytesIO(response.content))
+                
+                # Extract and combine all log files
+                all_logs = []
+                for filename in zip_file.namelist():
+                    with zip_file.open(filename) as log_file:
+                        content = log_file.read().decode('utf-8', errors='ignore')
+                        all_logs.append(f"=== {filename} ===\n{content}\n")
+                
+                return '\n'.join(all_logs)
+            except Exception as e:
+                print(f"Error extracting logs: {e}")
+                # Try to return raw content if zip extraction fails
+                return response.text if response.text else str(response.content)
+        else:
+            # If logs aren't available, try to get job details
+            jobs_url = f"{self.base_url}/actions/runs/{run_id}/jobs"
+            jobs_response = requests.get(jobs_url, headers=self.headers)
+            
+            if jobs_response.status_code == 200:
+                jobs = jobs_response.json().get('jobs', [])
+                error_summary = []
+                
+                for job in jobs:
+                    if job.get('conclusion') == 'failure':
+                        error_summary.append(f"Job '{job.get('name')}' failed")
+                        
+                        # Get the steps that failed
+                        if 'steps' in job:
+                            for step in job['steps']:
+                                if step.get('conclusion') == 'failure':
+                                    error_summary.append(f"  Failed step: {step.get('name')}")
+                
+                if error_summary:
+                    return "Build failed. Summary:\n" + '\n'.join(error_summary)
+            
+            return f"Could not retrieve logs for run {run_id}"
     
     def get_run_status(self, run_id: int) -> Dict:
         """Get status of a workflow run"""
@@ -357,7 +491,7 @@ class ConfigManager:
                 "github_timeout": 300,
                 "auto_commit": True,
                 "verbose_logging": True,
-                "claude_model": "claude-3-5-sonnet-20241022"
+                "claude_model": "claude-sonnet-4-20250514"
             }
             ConfigManager.save_config(default_config)
             return default_config
@@ -854,7 +988,12 @@ Build Automation Complete!
                 
                 # Let Claude analyze and fix
                 self.claude_log("Diagnosing build errors and generating fixes...")
-                fixes = self.claude.fix_build_errors(error_log, current_files, attempt)
+                fixes = self.claude.fix_build_errors(
+                    error_log, 
+                    current_files, 
+                    attempt,
+                    self.original_source_files if attempt >= 3 else None
+                )
                 
                 if fixes.get('confidence', 0) < 0.3:
                     self.log("Claude has low confidence in fixes", "WARNING")
@@ -869,7 +1008,9 @@ Build Automation Complete!
                 self.claude_log(f"Applying fixes: {fixes.get('diagnosis', '')}")
                 
                 files_updated = False
+                code_changes_needed = fixes.get('requires_code_change', False)
                 
+                # First try build configuration fixes
                 # Update vcpkg.json if needed
                 if fixes.get('vcpkg_changes'):
                     self.log("Updating vcpkg.json...")
@@ -903,11 +1044,44 @@ Build Automation Complete!
                         current_files['workflow.yml'] = fixes['workflow_changes']
                         files_updated = True
                 
-                # Apply code changes if absolutely necessary
-                if fixes.get('code_changes') and attempt == max_attempts - 1:
-                    self.log("Claude suggests code changes:", "WARNING")
-                    for filename, changes in fixes['code_changes'].items():
-                        self.claude_log(f"Code change needed in {filename}: {changes}")
+                # Apply code changes only when necessary
+                if fixes.get('code_changes') and isinstance(fixes['code_changes'], dict):
+                    # Check if we should apply code changes based on attempt number
+                    should_apply_code_changes = (
+                        (attempt >= 3 and code_changes_needed) or  # After 3 attempts if needed
+                        (attempt >= max_attempts - 1)  # On last attempt
+                    )
+                    
+                    if should_apply_code_changes:
+                        self.log("Applying necessary code changes...", "WARNING")
+                        self.claude_log("Code modifications required to fix compilation errors")
+                        
+                        # Apply the code changes
+                        modified_files = self.apply_code_changes(
+                            fixes['code_changes'],
+                            self.original_source_files
+                        )
+                        
+                        # Push modified source files
+                        for filename, content in modified_files.items():
+                            if self.github.create_or_update_file(
+                                filename,
+                                content,
+                                f"Claude fix {attempt}: Fix compilation error in {filename}"
+                            ):
+                                self.log(f"Updated source file: {filename}", "SUCCESS")
+                                # Update our local copy
+                                self.original_source_files[filename] = content
+                                files_updated = True
+                            else:
+                                self.log(f"Failed to update {filename}", "ERROR")
+                    else:
+                        # Just log the suggestions for now
+                        self.log("Code changes suggested but not applied yet", "INFO")
+                        self.claude_log(f"Deferring code changes to attempt {attempt + 1}")
+                        for filename, change in fixes['code_changes'].items():
+                            if isinstance(change, dict):
+                                self.claude_log(f"Will modify {filename}: {change.get('explanation', '')}")
                 
                 if not files_updated:
                     self.log("No fixes could be applied", "WARNING")
